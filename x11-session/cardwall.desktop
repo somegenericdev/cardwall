@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=Cardwall
+Comment=Anki-gated GNOME session — you must finish today's cards before the desktop starts
+Exec=/usr/local/bin/cardwall-session
+TryExec=/usr/local/bin/cardwall-session
+Type=Application
+DesktopNames=GNOME

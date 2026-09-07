@@ -1,0 +1,588 @@
+#!/usr/bin/env python3
+"""
+cardwall-session
+────────────────
+An X11 session binary that:
+
+  1. Checks whether Anki has any cards due today via a Unix socket
+     served by the Cardwall Anki add-on.
+  2. If cards are due, launches Anki and polls until the count
+     reaches zero.
+  3. Once zero cards remain, exec()s into GNOME (or another
+     configured downstream session) — handing the session over
+     completely so this process is replaced.
+
+Configuration via environment variables
+  CARDWALL_SOCKET_PATH   – path to the Unix socket
+                           (default /run/user/<uid>/cardwall.sock)
+  CARDWALL_DOWNSTREAM    – session command to exec into
+                           (default: gnome-session)
+  CARDWALL_ANKI_CMD      – command used to launch Anki
+                           (default: anki)
+  CARDWALL_POLL_INTERVAL – seconds between polls (default: 5)
+  CARDWALL_CONNECT_RETRIES – how many times to retry connecting
+                             to the socket before giving up
+                             (default: 60, i.e. ~5 min at 5 s each)
+  CARDWALL_WINDOW_HALF   – whether to pin the Anki window (and the
+                           editor, see below) to half the screen at
+                           full height, since no window manager is
+                           running yet to do it for us
+                           (default: 1; set to 0 to disable)
+    CARDWALL_FOCUS_MODE    – how keyboard focus is handed to the pre-desktop
+                             Anki/editor windows, since no window manager is
+                             running yet to do it: "click" (default),
+                             "pointer" (focus follows mouse) or "off"
+  CARDWALL_EDITOR_FONT_SIZE – point size for the xterm that hosts nano
+                              (default: 18)
+    The editor pane is always a terminal running nano.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import select
+import socket
+import subprocess
+import sys
+import threading
+import time
+from collections.abc import Iterable
+
+# ── logging ────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  cardwall  %(levelname)s  %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("cardwall")
+
+# ── config ─────────────────────────────────────────────────────────────────
+_uid = os.getuid()
+
+SOCKET_PATH: str = os.environ.get(
+    "CARDWALL_SOCKET_PATH", f"/run/user/{_uid}/cardwall.sock"
+)
+DOWNSTREAM: list[str] = os.environ.get(
+    "CARDWALL_DOWNSTREAM", "gnome-session"
+).split()
+ANKI_CMD: list[str] = os.environ.get("CARDWALL_ANKI_CMD", "anki").split()
+POLL_INTERVAL: float = float(os.environ.get("CARDWALL_POLL_INTERVAL", "5"))
+CONNECT_RETRIES: int = int(os.environ.get("CARDWALL_CONNECT_RETRIES", "60"))
+WINDOW_HALF: bool = os.environ.get("CARDWALL_WINDOW_HALF", "1") != "0"
+# click   – focus the window you click on (needs python-xlib)
+# pointer – focus follows the mouse pointer
+# off     – do nothing
+FOCUS_MODE: str = os.environ.get("CARDWALL_FOCUS_MODE", "click").strip().lower()
+EDITOR_FONT_SIZE: int = int(os.environ.get("CARDWALL_EDITOR_FONT_SIZE", "18"))
+EDITOR_FONT_FAMILY: str = os.environ.get("CARDWALL_EDITOR_FONT_FAMILY", "Monospace")
+POINTER_FOCUS_INTERVAL: float = float(
+    os.environ.get("CARDWALL_POINTER_FOCUS_INTERVAL", "0.2")
+)
+
+
+# ── helpers ────────────────────────────────────────────────────────────────
+
+def _query_due() -> int | None:
+    """
+    Open a fresh connection to the add-on socket, send a due_count
+    request, and return the count.  Returns None on any error.
+    """
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(5)
+            s.connect(SOCKET_PATH)
+            s.sendall(b'{"cmd": "due_count"}\n')
+            data = b""
+            while not data.endswith(b"\n"):
+                chunk = s.recv(256)
+                if not chunk:
+                    break
+                data += chunk
+        payload = json.loads(data.decode().strip())
+        if "error" in payload:
+            log.warning("add-on error: %s", payload["error"])
+            return None
+        return int(payload["due"])
+    except Exception as exc:  # noqa: BLE001
+        log.debug("socket error: %s", exc)
+        return None
+
+
+def _wait_for_socket() -> bool:
+    """Block until the add-on socket appears, up to CONNECT_RETRIES attempts."""
+    log.info("waiting for Anki add-on socket at %s …", SOCKET_PATH)
+    for attempt in range(1, CONNECT_RETRIES + 1):
+        if os.path.exists(SOCKET_PATH):
+            count = _query_due()
+            if count is not None:
+                log.info("socket ready (attempt %d)", attempt)
+                return True
+        log.debug("attempt %d/%d – socket not ready", attempt, CONNECT_RETRIES)
+        time.sleep(POLL_INTERVAL)
+    log.error("timed out waiting for Anki socket after %d attempts", CONNECT_RETRIES)
+    return False
+
+
+def _get_screen_size() -> tuple[int, int] | None:
+    try:
+        geom = subprocess.check_output(
+            ["xdotool", "getdisplaygeometry"], text=True, timeout=5
+        ).split()
+        return int(geom[0]), int(geom[1])
+    except Exception as exc:  # noqa: BLE001
+        log.debug("could not get display geometry: %s", exc)
+        return None
+
+
+def _find_visible_window_by_class(wm_class: str) -> str | None:
+    try:
+        out = subprocess.check_output(
+            ["xdotool", "search", "--sync", "--onlyvisible", "--class", wm_class],
+            text=True,
+            timeout=30,
+        )
+        return out.split()[0]
+    except Exception as exc:  # noqa: BLE001
+        log.debug("could not find %s window: %s", wm_class, exc)
+        return None
+
+
+def _position_window_by_class(wm_class: str, x: int, width: int, screen_h: int) -> None:
+    """
+    Move/resize a window directly via xdotool, identified by WM_CLASS.
+
+    No window manager is running yet at this point in the session (that's
+    the whole point of Cardwall), so there's nothing to send a "maximize"
+    request to. Instead we manipulate the raw X11 window, which works
+    WM-less.
+    """
+    win_id = _find_visible_window_by_class(wm_class)
+    if win_id is None:
+        return
+    try:
+        subprocess.run(["xdotool", "windowmove", win_id, str(x), "0"], check=False)
+        subprocess.run(
+            ["xdotool", "windowsize", win_id, str(width), str(screen_h)], check=False
+        )
+        subprocess.run(["xdotool", "windowfocus", win_id], check=False)
+        log.info("positioned %s window at %d,0 size %dx%d", wm_class, x, width, screen_h)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("could not position %s window: %s", wm_class, exc)
+
+
+def _xdotool_shell_vars(args: list[str]) -> dict[str, int]:
+    """Run an xdotool command with --shell and parse its KEY=value output."""
+    try:
+        out = subprocess.check_output(args, text=True, timeout=5)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("xdotool %s failed: %s", " ".join(args[1:]), exc)
+        return {}
+    values: dict[str, int] = {}
+    for line in out.splitlines():
+        key, sep, value = line.partition("=")
+        if not sep:
+            continue
+        try:
+            values[key.strip()] = int(value.strip())
+        except ValueError:
+            continue
+    return values
+
+
+def _pointer_position() -> tuple[int, int] | None:
+    v = _xdotool_shell_vars(["xdotool", "getmouselocation", "--shell"])
+    if "X" not in v or "Y" not in v:
+        return None
+    return v["X"], v["Y"]
+
+
+def _window_geometry(win_id: str) -> tuple[int, int, int, int] | None:
+    v = _xdotool_shell_vars(["xdotool", "getwindowgeometry", "--shell", win_id])
+    if not {"X", "Y", "WIDTH", "HEIGHT"} <= v.keys():
+        return None
+    return v["X"], v["Y"], v["WIDTH"], v["HEIGHT"]
+
+
+def _click_focus_loop(wm_classes: list[str], stop: threading.Event) -> None:
+    """
+    Poor man's click-to-focus.
+
+    Takes a passive button grab on each target window; when one is clicked we
+    assign X input focus to it and replay the click so the application still
+    receives it. Focus then stays put until another window is clicked.
+    """
+    from Xlib import X, display as xdisplay
+
+    disp = xdisplay.Display()
+    grabbed: set[str] = set()
+    last_lookup = 0.0
+
+    try:
+        while not stop.is_set():
+            now = time.monotonic()
+            if now - last_lookup > 5:
+                last_lookup = now
+                for wm_class in wm_classes:
+                    win_id = _find_visible_window_by_class(wm_class)
+                    if win_id is None or win_id in grabbed:
+                        continue
+                    win = disp.create_resource_object("window", int(win_id))
+                    win.grab_button(
+                        X.AnyButton,
+                        X.AnyModifier,
+                        False,
+                        X.ButtonPressMask,
+                        X.GrabModeSync,
+                        X.GrabModeAsync,
+                        X.NONE,
+                        X.NONE,
+                    )
+                    grabbed.add(win_id)
+                    log.info("click focus armed for %s window %s", wm_class, win_id)
+                disp.sync()
+
+            while disp.pending_events():
+                event = disp.next_event()
+                if event.type != X.ButtonPress:
+                    continue
+                try:
+                    disp.set_input_focus(event.window, X.RevertToParent, X.CurrentTime)
+                finally:
+                    # Replay so the application still receives the click itself.
+                    disp.allow_events(X.ReplayPointer, X.CurrentTime)
+                disp.sync()
+
+            select.select([disp.fileno()], [], [], POINTER_FOCUS_INTERVAL)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("click focus stopped: %s", exc)
+    finally:
+        try:
+            disp.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _pointer_focus_loop(wm_classes: list[str], stop: threading.Event) -> None:
+    """
+    Poor man's focus-follows-mouse.
+
+    No window manager is running yet, so nothing assigns keyboard focus when
+    a window is clicked — whatever got focus first keeps every keystroke.
+    We poll the pointer position and hand X input focus to the window it is
+    over, which is enough to type into both Anki and the editor.
+    """
+    windows: list[str] = []
+    last_lookup = 0.0
+    focused: str | None = None
+
+    while not stop.is_set():
+        now = time.monotonic()
+        if not windows or now - last_lookup > 5:
+            last_lookup = now
+            found = [
+                win
+                for win in (_find_visible_window_by_class(c) for c in wm_classes)
+                if win is not None
+            ]
+            if found:
+                windows = found
+
+        pointer = _pointer_position()
+        if pointer is not None:
+            px, py = pointer
+            for win_id in windows:
+                geom = _window_geometry(win_id)
+                if geom is None:
+                    continue
+                x, y, w, h = geom
+                if x <= px < x + w and y <= py < y + h:
+                    if win_id != focused:
+                        subprocess.run(
+                            ["xdotool", "windowfocus", win_id],
+                            check=False,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                        focused = win_id
+                    break
+
+        stop.wait(POINTER_FOCUS_INTERVAL)
+
+
+def _enable_focus(wm_classes: Iterable[str]) -> threading.Event | None:
+    classes = list(wm_classes)
+    mode = FOCUS_MODE
+    if mode == "off":
+        return None
+    if mode not in ("click", "pointer"):
+        log.warning("unknown CARDWALL_FOCUS_MODE %r — using click", FOCUS_MODE)
+        mode = "click"
+
+    target = _click_focus_loop if mode == "click" else _pointer_focus_loop
+    stop = threading.Event()
+    threading.Thread(target=target, args=(classes, stop), daemon=True).start()
+    log.info("%s focus enabled for: %s", mode, ", ".join(classes))
+    return stop
+
+
+class _WindowGate:
+    """
+    Holds back new X windows until we know a study session is starting.
+
+    No window manager is running yet, so we can claim the root window's
+    substructure redirect ourselves: every MapRequest then comes to us
+    instead of being honoured by the X server, which lets Anki start up
+    completely invisibly while we ask the add-on whether anything is due.
+    If nothing is, Anki is killed without a single frame ever reaching the
+    screen. Because we hold the redirect we must also service the windows'
+    ConfigureRequests, which would otherwise be dropped as well.
+    """
+
+    def __init__(self) -> None:
+        self._pending: list = []
+        self._release = threading.Event()
+        self._stop = threading.Event()
+        self._released = False
+        self._disp = None
+        self._X = None
+
+    def start(self) -> bool:
+        try:
+            from Xlib import X, display as xdisplay, error as xerror
+        except Exception as exc:  # noqa: BLE001
+            log.warning("python-xlib unavailable (%s) – windows cannot be hidden", exc)
+            return False
+
+        try:
+            disp = xdisplay.Display()
+            catch = xerror.CatchError(xerror.BadAccess)
+            disp.screen().root.change_attributes(
+                event_mask=X.SubstructureRedirectMask | X.SubstructureNotifyMask,
+                onerror=catch,
+            )
+            disp.sync()
+            if catch.get_error():
+                log.warning("display already has a window manager – not hiding windows")
+                disp.close()
+                return False
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not gate windows: %s", exc)
+            return False
+
+        self._disp = disp
+        self._X = X
+        threading.Thread(target=self._loop, daemon=True).start()
+        log.info("windows held back until the due count is known")
+        return True
+
+    def release(self) -> None:
+        self._release.set()
+
+    def _loop(self) -> None:
+        X, disp = self._X, self._disp
+        try:
+            while not self._stop.is_set():
+                if self._release.is_set() and not self._released:
+                    self._released = True
+                    for win in self._pending:
+                        self._safe(win.map)
+                    self._pending.clear()
+                    disp.flush()
+
+                while disp.pending_events():
+                    event = disp.next_event()
+                    if event.type == X.MapRequest:
+                        if self._released:
+                            self._safe(event.window.map)
+                        else:
+                            self._pending.append(event.window)
+                    elif event.type == X.ConfigureRequest:
+                        self._configure(event)
+
+                disp.flush()
+                select.select([disp.fileno()], [], [], 0.1)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("window gate stopped: %s", exc)
+
+    def _configure(self, event) -> None:
+        X = self._X
+        mask = event.value_mask
+        args = {}
+        if mask & X.CWX:
+            args["x"] = event.x
+        if mask & X.CWY:
+            args["y"] = event.y
+        if mask & X.CWWidth:
+            args["width"] = event.width
+        if mask & X.CWHeight:
+            args["height"] = event.height
+        if mask & X.CWBorderWidth:
+            args["border_width"] = event.border_width
+        if mask & X.CWStackMode:
+            args["stack_mode"] = event.stack_mode
+        if args:
+            self._safe(lambda: event.window.configure(**args))
+
+    @staticmethod
+    def _safe(fn) -> None:
+        try:
+            fn()
+        except Exception as exc:  # noqa: BLE001
+            log.debug("window gate request failed: %s", exc)
+
+
+def _position_anki_window() -> None:
+    """Pin the Anki window to the left half of the screen at full height."""
+    size = _get_screen_size()
+    if size is None:
+        return
+    screen_w, screen_h = size
+    _position_window_by_class("anki", 0, screen_w // 2, screen_h)
+
+
+def _position_editor_window(wm_class: str) -> None:
+    """Pin the editor window to the right half of the screen at full height."""
+    size = _get_screen_size()
+    if size is None:
+        return
+    screen_w, screen_h = size
+    half_w = screen_w // 2
+    _position_window_by_class(wm_class, half_w, screen_w - half_w, screen_h)
+
+
+def _launch_anki() -> subprocess.Popen:
+    log.info("launching Anki: %s", " ".join(ANKI_CMD))
+    return subprocess.Popen(
+        ANKI_CMD,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _launch_editor() -> subprocess.Popen | None:
+    cmd = [
+        "xterm",
+        "-fa",
+        EDITOR_FONT_FAMILY,
+        "-fs",
+        str(EDITOR_FONT_SIZE),
+        "-e",
+        "nano",
+    ]
+    log.info("launching editor: %s", " ".join(cmd))
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("failed to launch editor %s: %s", cmd, exc)
+        return None
+    threading.Thread(
+        target=_position_editor_window, args=(cmd[0],), daemon=True
+    ).start()
+    return proc
+
+
+def _terminate_process(proc: subprocess.Popen | None, name: str) -> None:
+    if proc is None or proc.poll() is not None:
+        return
+    log.info("terminating %s before starting the desktop", name)
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        log.warning("%s did not terminate cleanly; killing it", name)
+        proc.kill()
+        proc.wait()
+
+
+def _exec_downstream(
+    anki_proc: subprocess.Popen | None = None,
+    editor_proc: subprocess.Popen | None = None,
+    focus_stop: threading.Event | None = None,
+) -> None:
+    """Replace this process with the downstream session (e.g. gnome-session)."""
+    if focus_stop is not None:
+        focus_stop.set()
+    _terminate_process(anki_proc, "Anki")
+    _terminate_process(editor_proc, "the text editor")
+    log.info("all cards done — exec: %s", " ".join(DOWNSTREAM))
+    os.execvp(DOWNSTREAM[0], DOWNSTREAM)
+    # unreachable if exec succeeds
+
+
+# ── main ───────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    log.info("Cardwall session starting")
+
+    # ── 1. Quick check before launching Anki ──────────────────────────────
+    # If Anki is already open (e.g. re-login), check immediately.
+    initial = _query_due()
+
+    if initial == 0:
+        log.info("no cards due – going straight to desktop")
+        _exec_downstream()
+        sys.exit(1)  # only reached if exec fails
+
+    # ── 2. Launch Anki, invisibly ─────────────────────────────────────────
+    # The due count is unknown until the add-on socket answers, and Anki has
+    # to be running for that to happen — so hold its windows back until we
+    # know whether this is an actual study session.
+    gate = _WindowGate()
+    gate.start()
+    anki_proc = _launch_anki()
+    editor_proc: subprocess.Popen | None = None
+    focus_stop: threading.Event | None = None
+
+    # ── 3. Wait for the add-on socket ─────────────────────────────────────
+    if not _wait_for_socket():
+        log.error(
+            "could not contact Anki add-on; "
+            "aborting lock — starting desktop anyway to avoid hard lockout"
+        )
+        _exec_downstream(anki_proc, editor_proc, focus_stop)
+        sys.exit(1)
+
+    if _query_due() == 0:
+        log.info("no cards due – going straight to desktop")
+        _exec_downstream(anki_proc, editor_proc, focus_stop)
+        sys.exit(1)
+
+    # ── 4. Show the study UI now that we know there is work to do ─────────
+    gate.release()
+    if WINDOW_HALF:
+        threading.Thread(target=_position_anki_window, daemon=True).start()
+        editor_proc = _launch_editor()
+    focus_stop = _enable_focus(["anki", "xterm"] if WINDOW_HALF else ["anki"])
+
+    # ── 5. Poll until zero due ────────────────────────────────────────────
+    log.info("polling every %.0f s …", POLL_INTERVAL)
+    while True:
+        count = _query_due()
+        if count is None:
+            # Anki may have been closed by the user – relaunch it
+            if anki_proc.poll() is not None:
+                log.warning("Anki exited – relaunching")
+                anki_proc = _launch_anki()
+                if WINDOW_HALF:
+                    threading.Thread(target=_position_anki_window, daemon=True).start()
+                if not _wait_for_socket():
+                    log.error("could not reconnect; aborting lock")
+                    _exec_downstream(anki_proc, editor_proc, focus_stop)
+                    sys.exit(1)
+        elif count == 0:
+            log.info("due count reached zero")
+            break
+        else:
+            log.info("%d card(s) still due", count)
+
+        time.sleep(POLL_INTERVAL)
+
+    # ── 6. Hand session to GNOME (or configured downstream) ───────────────
+    _exec_downstream(anki_proc, editor_proc, focus_stop)
+    sys.exit(1)  # only reached if exec fails
+
+
+if __name__ == "__main__":
+    main()

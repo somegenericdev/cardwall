@@ -1,0 +1,9 @@
+{
+    "name": "Cardwall",
+    "package": "cardwall",
+    "author": "Cardwall",
+    "version": "1.0.0",
+    "description": "Exposes a Unix socket so the Cardwall session binary can query the due-card count.",
+    "homepage": "",
+    "conflicts": ""
+}
